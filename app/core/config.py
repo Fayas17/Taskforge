@@ -33,9 +33,16 @@ class Settings(BaseSettings):
     REDIS_HOST: str
     REDIS_PORT: int
 
+    # File Upload
+    UPLOAD_DIR: str = "uploads"
+
     # Celery
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
+    CSV_CHUNK_SIZE: int = 100
+    CSV_TASK_SOFT_TIME_LIMIT: int = 600
+    CSV_TASK_MAX_RETRIES: int = 3
+    CSV_TASK_RETRY_DELAY: int = 60
 
     # JWT
     SECRET_KEY: str
@@ -47,6 +54,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_REGISTER: str = "3/minute"
     RATE_LIMIT_LOGIN: str = "5/minute"
     RATE_LIMIT_REFRESH: str = "10/minute"
+    RATE_LIMIT_JOBS_UPLOAD: str = "5/minute"
 
     # Cookies
     COOKIE_SECURE: bool
