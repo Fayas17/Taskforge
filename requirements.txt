@@ -31,3 +31,5 @@ slowapi
 redis
 
 structlog
+
+python-multipart
