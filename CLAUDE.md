@@ -19,9 +19,26 @@ heavy processing work.
 - Logout with cookie clearing and DB-level token invalidation
 - `GET /auth/me/` — fetch authenticated user profile
 
+### Jobs Module
+- `job.jobs` table — tracks CSV upload lifecycle: pending → processing → completed/failed
+- `job.job_data` table — stores each parsed CSV row as JSONB (one row per record)
+- Pydantic schemas: `JobResponse` (post-upload) and `JobStatusResponse` (progress polling)
+- Repository layer — async CRUD: `create_job`, `get_job_by_id`, `get_jobs_by_user`, `update_job`, `create_job_data`
+- Service layer — file validation, disk storage, Celery dispatch, ownership checks
+- `POST /jobs/upload/` — validates CSV, saves to disk, creates job record, dispatches Celery task
+- `GET /jobs/{id}/` — returns full job status with progress counters and result data
+- `GET /jobs/` — lists all jobs for the authenticated user
+- Celery worker (`app.worker.tasks.process_csv`) — processes rows in configurable chunks
+- Checkpoint-based resume — on retry, skips already-committed rows using `processed_rows`
+- Per-row error capture — failed rows stored in `error_detail` JSONB, not in `job_data`
+- Soft time limit handling — saves progress and retries instead of silently failing
+- Idempotency guard — completed jobs are never reprocessed on retry
+- Structured logging at every stage: upload, dispatch, chunk commit, completion, failure
+
 ### Infrastructure
 - Async SQLAlchemy 2.0 with asyncpg driver — non-blocking DB operations
-- Alembic migrations — versioned schema management (`auth.users`, `auth.refresh_tokens`)
+- Sync psycopg2 engine in Celery worker — strict async/sync separation
+- Alembic migrations — versioned schema management (`auth.users`, `auth.refresh_tokens`, `job.jobs`, `job.job_data`)
 - Redis-backed rate limiting via SlowAPI (per-IP, per-route limits)
 - Structured JSON logging via structlog with request_id tracing
 - Dedicated security audit log (`logs/security.log`) with 1-year retention
@@ -34,8 +51,13 @@ heavy processing work.
 
 ### Testing
 - Unit tests: JWT token creation, password hashing/verification
+- Unit tests: Celery task logic (job not found, already completed, success, resume, row failure, soft time limit)
+- Unit tests: service layer validation (file type rejection, 404/403 ownership checks)
 - Integration tests: register, login, logout, token refresh, `GET /me`, rate limiting, security edge cases
+- Integration tests: CSV upload, job status polling, cross-user access (403), unauthenticated access (401)
+- Integration tests: repository layer — create/get/update job, user isolation, job_data storage
 - Savepoint-based transaction rollback — each test is fully isolated, no data pollution
+- Celery patched in integration tests — no Redis connection required
 - Separate test PostgreSQL instance (port 5433)
 - In-memory Redis for rate limiter tests
 
@@ -65,7 +87,7 @@ progress tracking, per-row error capture, and automatic retries.
                           ┌────────────▼────────────────────┐
                           │         FastAPI App              │
                           │  ┌──────────┐  ┌─────────────┐  │
-                          │  │   Auth   │  │  Jobs (WIP) │  │
+                          │  │   Auth   │  │    Jobs     │  │
                           │  │  Module  │  │   Module    │  │
                           │  └──────────┘  └──────┬──────┘  │
                           │   Middleware Stack     │         │
@@ -81,7 +103,7 @@ progress tracking, per-row error capture, and automatic retries.
                     │  └───────────┘  │    ┌───────▼──────────┐
                     └─────────────────┘    │  Celery Worker   │
                              ▲             │  (CSV Processor) │
-                             └─────────────┘  (WIP)
+                             └─────────────┘
 ```
 
 ---
@@ -105,25 +127,35 @@ progress tracking, per-row error capture, and automatic retries.
 
 ### Auth Flow (Implemented)
 ```
-1. POST /auth/register/     → hash password → INSERT auth.users
-2. POST /auth/login/        → verify password → issue JWT pair → SET cookies
-3. GET  /auth/me/           → validate access token → SELECT auth.users
-4. POST /auth/refresh/      → validate refresh token → rotate → SET new cookies
-5. POST /auth/logout/       → revoke refresh token → CLEAR cookies
-6. GET  /auth/google/login/ → redirect to Google OAuth consent
+1. POST /auth/register/        → hash password → INSERT auth.users
+2. POST /auth/login/           → verify password → issue JWT pair → SET cookies
+3. GET  /auth/me/              → validate access token → SELECT auth.users
+4. POST /auth/refresh/         → validate refresh token → rotate → SET new cookies
+5. POST /auth/logout/          → revoke refresh token → CLEAR cookies
+6. GET  /auth/google/login/    → redirect to Google OAuth consent
 7. GET  /auth/google/callback/ → exchange code → upsert user → SET cookies
 ```
 
-### Ingestion Flow (Planned)
+### Ingestion Flow (Implemented)
 ```
-1. POST /jobs/upload/       → validate CSV → save file → INSERT job.jobs (status=pending)
-2.                          → celery_app.send_task() → push to Redis queue → return job_id
-3. Celery worker            → dequeue task → open file → process rows in chunks
-4.                          → INSERT job.job_data rows (JSONB per row)
-5.                          → UPDATE job.jobs (processed_rows++, status=processing)
-6.                          → on completion: UPDATE status=completed, result_data (JSONB)
-7.                          → on row failure: append to error_detail (JSONB), failed_rows++
-8. GET  /jobs/{id}/         → return job status + progress + result_data
+1. POST /jobs/upload/     → validate CSV → save to disk (uploads/{job_id}/) →
+                            INSERT job.jobs (status=pending) →
+                            process_csv.delay(job_id) → push to Redis → return job
+2. Celery worker          → dequeue task → set status=processing →
+                            read file → count total_rows →
+                            process rows in chunks (CSV_CHUNK_SIZE) →
+                            INSERT job.job_data rows (JSONB per row) →
+                            UPDATE job.jobs (processed_rows, failed_rows) every chunk →
+                            on row failure: append to error_detail, increment failed_rows →
+                            on completion: status=completed, result_data (JSONB), completed_at
+3. GET  /jobs/{id}/       → return job status + progress + result_data + error_detail
+4. GET  /jobs/            → return all jobs for authenticated user
+
+Retry / failure handling:
+- SoftTimeLimitExceeded   → flush current chunk → save processed_rows → self.retry()
+- Unexpected exception    → save processed_rows → self.retry() (max 3 attempts)
+- Retry resume            → read job.processed_rows → skip already-committed rows
+- Already completed       → skip (idempotency guard)
 ```
 
 ---
@@ -163,11 +195,24 @@ models. Every schema change is a versioned, reviewable, rollback-capable file.
 | Token revocation | JTI hashed with SHA-256, stored in `auth.refresh_tokens` |
 | Token rotation | Old refresh token revoked on every `/auth/refresh/` call |
 | Cookie security | HttpOnly, Secure (configurable), SameSite=lax |
-| Rate limiting | Redis-backed SlowAPI — 3/min register, 5/min login, 10/min refresh |
+| Rate limiting | Redis-backed SlowAPI — 3/min register, 5/min login, 10/min refresh, 5/min upload |
 | OAuth2 | Google OpenID Connect — no password stored for OAuth users |
 | Audit logging | Dedicated `logs/security.log` — all auth events logged with IP + device |
 | Device tracking | IP, user-agent, and device stored per refresh token |
+| Job ownership | Service layer enforces user_id check — 403 on cross-user access |
 | Dependency scanning | pip-audit in CI pipeline — known CVEs documented and tracked |
+
+---
+
+## Worker Configuration (via `.env`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CSV_CHUNK_SIZE` | 100 | Rows committed per DB batch |
+| `CSV_TASK_SOFT_TIME_LIMIT` | 600 | Seconds before SoftTimeLimitExceeded |
+| `CSV_TASK_MAX_RETRIES` | 3 | Max retry attempts per task |
+| `CSV_TASK_RETRY_DELAY` | 60 | Seconds between retries |
+| `UPLOAD_DIR` | uploads | Directory for uploaded CSV files |
 
 ---
 
@@ -187,6 +232,9 @@ a single process. DB operations never block the event loop.
 **Schema separation:** `auth` and `job` PostgreSQL schemas are logically isolated. Each
 module owns its schema — no cross-module table joins in the hot path.
 
+**Checkpoint-based resume:** Large file processing resumes from the last committed row on
+retry — no duplicate inserts, no restarting from zero on partial failures.
+
 ---
 
 ## Failure Handling
@@ -195,18 +243,12 @@ module owns its schema — no cross-module table joins in the hot path.
 - Refresh token revocation on logout prevents reuse after session end
 - Database rollback on integrity errors (duplicate email/username)
 - JWT validation with type checking (access vs refresh token type enforcement)
-- Rate limiting prevents brute-force on login/register
-
-### Planned (Jobs module)
-- **Celery retries:** `max_retries=3` with exponential backoff (60s, 120s, 240s)
-- **`task_acks_late=True`:** task message only ACKed after completion — worker crash
-  returns the task to the queue automatically
-- **Per-row error capture:** failed rows stored in `error_detail` JSONB with row index,
-  error message, and raw data — user can inspect and retry
-- **Idempotent retries:** task checks `job.status == "completed"` before re-processing;
-  partial `job_data` rows are cleared before a retry run
-- **Soft time limit:** `SoftTimeLimitExceeded` caught gracefully — job marked failed with
-  partial progress preserved
+- Rate limiting prevents brute-force on login/register and upload spam
+- `task_acks_late=True` — task re-queued automatically if worker crashes
+- `SoftTimeLimitExceeded` caught — progress saved, task retried from checkpoint
+- Per-row error capture — failed rows in `error_detail` JSONB, task continues
+- Idempotent retries — `status == "completed"` guard prevents double processing
+- Max 3 retries with 60s delay — prevents infinite retry loops
 
 ---
 
@@ -217,6 +259,12 @@ module owns its schema — no cross-module table joins in the hot path.
 docker-compose up --build
 # FastAPI:  http://localhost:8000
 # Docs:     http://localhost:8000/docs
+```
+
+### Running the Celery Worker
+```bash
+# Inside the container or locally
+celery -A app.worker.celery_app worker --loglevel=info -Q csv_processing
 ```
 
 ### Database Migrations
@@ -239,7 +287,7 @@ Multi-stage Dockerfile:
 ### Environment
 All secrets and config loaded from `.env` via Pydantic `BaseSettings`. Required vars:
 `SECRET_KEY`, `POSTGRES_*`, `REDIS_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
-`CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`.
+`CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`, `UPLOAD_DIR`.
 
 ### Production Checklist
 - [ ] Set `COOKIE_SECURE=true` and `DEBUG=false`
@@ -247,6 +295,7 @@ All secrets and config loaded from `.env` via Pydantic `BaseSettings`. Required 
 - [ ] Rotate `SECRET_KEY` and store in a secrets manager (not `.env`)
 - [ ] Configure `pool_size` and `max_overflow` on the SQLAlchemy engine
 - [ ] Enable `celery_worker` service in docker-compose (or deploy as separate container)
+- [ ] Mount shared volume between `app` and `celery_worker` for `UPLOAD_DIR`
 - [ ] Set up log aggregation (Datadog, Loki, CloudWatch)
 
 ---
@@ -259,10 +308,17 @@ All secrets and config loaded from `.env` via Pydantic `BaseSettings`. Required 
 | Google OAuth2 | Done |
 | JWT rotation + revocation | Done |
 | Alembic migrations | Done |
-| CSV upload endpoint | Planned |
-| Celery worker + task definitions | Planned |
-| Job progress tracking (JSONB) | Planned |
-| Per-row error capture + retry | Planned |
+| Job DB models (`job.jobs`, `job.job_data`) | Done |
+| Job Pydantic schemas | Done |
+| Job repository layer | Done |
+| Job service layer | Done |
+| CSV upload endpoint (`POST /jobs/upload/`) | Done |
+| Job status endpoint (`GET /jobs/{id}/`) | Done |
+| Job list endpoint (`GET /jobs/`) | Done |
+| Celery worker + CSV task | Done |
+| Checkpoint-based retry resume | Done |
+| Per-row error capture | Done |
+| docker-compose celery_worker service + shared volume | Planned |
 | Prometheus `/metrics` endpoint | Planned |
 | OpenTelemetry distributed tracing | Planned |
 | Celery Flower monitoring UI | Planned |
