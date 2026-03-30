@@ -8,6 +8,7 @@ from app.core.database import Base
 
 # Import all models so Alembic autogenerate can detect schema changes
 from app.modules.auth.models import RefreshToken, User  # noqa: F401
+from app.modules.jobs.models import Job, JobData  # noqa: F401
 
 app_settings = get_settings()
 
