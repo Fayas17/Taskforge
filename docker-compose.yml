@@ -33,6 +33,7 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - .:/app
+      - csv_uploads:/app/uploads
     ports:
       - "8000:8000"
     env_file:
@@ -41,16 +42,19 @@ services:
       - postgres
       - redis
 
-  # celery_worker:
-  #   build: .
-  #   container_name: taskforge_worker
-  #   command: celery -A app.worker.celery_app worker --loglevel=info
-  #   env_file:
-  #     - .env
-  #   depends_on:
-  #     - redis
-  #     - postgres
+  celery_worker:
+    build: .
+    container_name: taskforge_worker
+    command: celery -A app.worker.celery_app worker --loglevel=info -Q csv_processing
+    volumes:
+      - csv_uploads:/app/uploads
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - postgres
 
 volumes:
   postgres_data:
   test_db_data:
+  csv_uploads:
