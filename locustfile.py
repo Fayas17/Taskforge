@@ -16,7 +16,7 @@ import io
 import random
 import time
 import uuid
-from typing import Any, ClassVar
+from typing import Any
 
 from locust import HttpUser, between, task
 
@@ -76,9 +76,9 @@ class TaskForgeUser(HttpUser):
     """
 
     wait_time = between(1, 3)
-    job_ids: ClassVar[list[str]] = []
 
     def on_start(self) -> None:
+        self.job_ids: list[str] = []
         # Stagger startup to avoid all users hitting rate limits simultaneously
         time.sleep(random.uniform(0, 5))  # noqa: S311
         _, success = _register_and_login(self.client)
@@ -162,9 +162,9 @@ class WorkerStressUser(HttpUser):
     """
 
     wait_time = between(30, 60)  # wait between uploads — worker needs time
-    job_ids: ClassVar[list[str]] = []
 
     def on_start(self) -> None:
+        self.job_ids: list[str] = []
         time.sleep(random.uniform(0, 10))  # noqa: S311
         _register_and_login(self.client)
 

@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     # Celery
     CELERY_BROKER_URL: str
     CELERY_RESULT_BACKEND: str
-    CSV_CHUNK_SIZE: int = 100
-    CSV_TASK_SOFT_TIME_LIMIT: int = 600
+    CSV_CHUNK_SIZE: int
+    CSV_TASK_SOFT_TIME_LIMIT: int
     CSV_TASK_MAX_RETRIES: int = 3
     CSV_TASK_RETRY_DELAY: int = 60
 

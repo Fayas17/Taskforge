@@ -28,8 +28,12 @@ heavy processing work.
 - `POST /jobs/upload/` — validates CSV, saves to disk, creates job record, dispatches Celery task
 - `GET /jobs/{id}/` — returns full job status with progress counters and result data
 - `GET /jobs/` — lists all jobs for the authenticated user
-- Celery worker (`app.worker.tasks.process_csv`) — processes rows in configurable chunks
-- Checkpoint-based resume — on retry, skips already-committed rows using `processed_rows`
+- `POST /jobs/{id}/retry/` — re-dispatches failed jobs only; pending/processing/completed are rejected
+- Celery worker (`app.worker.tasks.process_csv`) — two-pass streaming: count rows then process
+- Two-pass CSV processing — Pass 1 counts rows (no RAM usage), Pass 2 streams one chunk at a time
+- Byte offset checkpointing — saves file position after each chunk; retry seeks instantly, no row scanning
+- Chunk-based processing (CSV_CHUNK_SIZE=5000) — 50× fewer DB commits vs row-by-row
+- Priority queue routing — files < 1 MB → `csv_priority`, larger → `csv_processing`
 - Per-row error capture — failed rows stored in `error_detail` JSONB, not in `job_data`
 - Soft time limit handling — saves progress and retries instead of silently failing
 - Idempotency guard — completed jobs are never reprocessed on retry
@@ -140,22 +144,30 @@ progress tracking, per-row error capture, and automatic retries.
 ```
 1. POST /jobs/upload/     → validate CSV → save to disk (uploads/{job_id}/) →
                             INSERT job.jobs (status=pending) →
-                            process_csv.delay(job_id) → push to Redis → return job
+                            route by file size: < 1MB → csv_priority, else → csv_processing →
+                            process_csv.apply_async(job_id, queue=queue) → push to Redis → return job
+
 2. Celery worker          → dequeue task → set status=processing →
-                            read file → count total_rows →
-                            process rows in chunks (CSV_CHUNK_SIZE) →
+                            Pass 1: count rows with csv.reader (no RAM spike) →
+                            UPDATE total_rows →
+                            Pass 2: seek to file_offset (instant resume) →
+                            stream rows one chunk at a time (CSV_CHUNK_SIZE=5000) →
                             INSERT job.job_data rows (JSONB per row) →
-                            UPDATE job.jobs (processed_rows, failed_rows) every chunk →
+                            UPDATE processed_rows, failed_rows, file_offset every chunk →
                             on row failure: append to error_detail, increment failed_rows →
                             on completion: status=completed, result_data (JSONB), completed_at
+
 3. GET  /jobs/{id}/       → return job status + progress + result_data + error_detail
 4. GET  /jobs/            → return all jobs for authenticated user
+5. POST /jobs/{id}/retry/ → only allowed for failed jobs; pending/processing → 400
 
 Retry / failure handling:
-- SoftTimeLimitExceeded   → flush current chunk → save processed_rows → self.retry()
-- Unexpected exception    → save processed_rows → self.retry() (max 3 attempts)
-- Retry resume            → read job.processed_rows → skip already-committed rows
+- SoftTimeLimitExceeded   → rollback session → save last_committed checkpoint → self.retry()
+- Unexpected exception    → rollback session → save last_committed checkpoint → self.retry()
+- Retry resume            → f.seek(job.file_offset) → instant jump, no row scanning
 - Already completed       → skip (idempotency guard)
+- Retry on pending job    → 400 "queued, worker will pick it up shortly"
+- Retry on processing job → 400 "currently being processed, please wait"
 ```
 
 ---
@@ -208,8 +220,8 @@ models. Every schema change is a versioned, reviewable, rollback-capable file.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `CSV_CHUNK_SIZE` | 100 | Rows committed per DB batch |
-| `CSV_TASK_SOFT_TIME_LIMIT` | 600 | Seconds before SoftTimeLimitExceeded |
+| `CSV_CHUNK_SIZE` | 5000 | Rows committed per DB batch (50× fewer commits vs 100) |
+| `CSV_TASK_SOFT_TIME_LIMIT` | 3600 | Seconds before SoftTimeLimitExceeded (1 hr for large files) |
 | `CSV_TASK_MAX_RETRIES` | 3 | Max retry attempts per task |
 | `CSV_TASK_RETRY_DELAY` | 60 | Seconds between retries |
 | `UPLOAD_DIR` | uploads | Directory for uploaded CSV files |
@@ -222,9 +234,12 @@ models. Every schema change is a versioned, reviewable, rollback-capable file.
 pointing at the same Redis broker to increase processing throughput. Each worker processes
 one CSV task at a time (`worker_prefetch_multiplier=1`) to prevent head-of-line blocking.
 
-**Queue isolation:** CSV processing tasks route to a dedicated `csv_processing` queue.
-Future task types (email, exports, webhooks) get separate queues — no one workload starves
-another.
+**Priority queue routing:** Two queues — `csv_priority` (files < 1 MB, fast jobs) and
+`csv_processing` (large files). Workers consume `csv_priority` first, so small jobs are
+never blocked behind a 2.5M row job. Workers run with `-Q csv_priority,csv_processing`.
+
+**Queue isolation:** CSV processing tasks route to dedicated queues. Future task types
+(email, exports, webhooks) get separate queues — no one workload starves another.
 
 **Async API layer:** FastAPI with asyncpg handles thousands of concurrent connections on
 a single process. DB operations never block the event loop.
@@ -232,8 +247,22 @@ a single process. DB operations never block the event loop.
 **Schema separation:** `auth` and `job` PostgreSQL schemas are logically isolated. Each
 module owns its schema — no cross-module table joins in the hot path.
 
-**Checkpoint-based resume:** Large file processing resumes from the last committed row on
-retry — no duplicate inserts, no restarting from zero on partial failures.
+**Byte offset checkpointing:** After each chunk commit, the worker saves the exact file
+byte position (`file_offset`). On retry, `f.seek(file_offset)` jumps instantly to the
+resume point — no scanning through already-committed rows.
+
+**Streaming processing:** CSV is never fully loaded into RAM. Pass 1 counts rows with a
+buffered line scan (~8KB buffer). Pass 2 streams one chunk at a time (~1MB per worker).
+Three workers processing simultaneously use ~3MB total, not hundreds of MB.
+
+**Known limitation — idle workers on uneven workloads:** Each job is processed by a single
+worker. If two jobs are queued (2.5M rows and 250k rows), Worker 1 takes the large job and
+Worker 2 takes the small job. After Worker 2 finishes, it sits idle until a new job arrives
+— it cannot help Worker 1 with the remaining rows. The production solution is fan-out
+processing: split large files into N chunk tasks at upload time, one Celery task per chunk,
+so multiple workers collaborate on the same file. A coordinator task marks the job complete
+when all chunks finish. This is a deliberate scope decision — correctness and reliability
+were prioritised first.
 
 ---
 
@@ -245,9 +274,11 @@ retry — no duplicate inserts, no restarting from zero on partial failures.
 - JWT validation with type checking (access vs refresh token type enforcement)
 - Rate limiting prevents brute-force on login/register and upload spam
 - `task_acks_late=True` — task re-queued automatically if worker crashes
-- `SoftTimeLimitExceeded` caught — progress saved, task retried from checkpoint
+- `SoftTimeLimitExceeded` caught — session rolled back, last_committed checkpoint saved, task retried
 - Per-row error capture — failed rows in `error_detail` JSONB, task continues
 - Idempotent retries — `status == "completed"` guard prevents double processing
+- Retry blocked on pending/processing jobs — prevents duplicate task dispatch race condition
+- Byte offset resume — retry seeks to exact file position, never rescans committed rows
 - Max 3 retries with 60s delay — prevents infinite retry loops
 
 ---
@@ -263,8 +294,8 @@ docker-compose up --build
 
 ### Running the Celery Worker
 ```bash
-# Inside the container or locally
-celery -A app.worker.celery_app worker --loglevel=info -Q csv_processing
+# Consumes csv_priority first, then csv_processing
+celery -A app.worker.celery_app worker --loglevel=info -Q csv_priority,csv_processing
 ```
 
 ### Database Migrations
